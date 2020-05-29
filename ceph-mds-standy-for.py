@@ -1,10 +1,7 @@
 import argparse
 import json
-import logging
 import subprocess
-
-
-logger = logging.getLogger(__name__)
+from time import sleep
 
 
 _DESC = 'Ensure standby_replay assignments to ranks matches a specification'
@@ -12,11 +9,13 @@ _DESC = 'Ensure standby_replay assignments to ranks matches a specification'
 
 def get_fs_map():
     # check if we can get a ceph fs dump
-    fs_dump = subprocess.run(['ceph', 'fs' 'dump', '--format', 'json'],
-                             capture_output=True)
+    fs_dump = subprocess.run(['ceph', 'fs', 'dump', '--format', 'json'],
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
     if fs_dump.returncode != 0:
-        logger.error(f'ERROR "ceph fs dump" returned rc: {fs_dump.returncode}')
-        logger.error(f'ERROR {fs_dump.stderr}')
+        print(f'ERROR "ceph fs dump" returned rc: {fs_dump.returncode}')
+        print(f'ERROR {fs_dump.args}')
+        print(f'ERROR {fs_dump.stderr}')
         exit(1)
 
     return json.loads(fs_dump.stdout)
@@ -24,17 +23,17 @@ def get_fs_map():
 
 def get_fs(name, fsmap):
     for fs in fsmap['filesystems']:
-        if fs['name'] == name:
-            logger.info(f'Found requested file system {name}')
-            return fs
+        if fs['mdsmap']['fs_name'] == name:
+            print(f'Found requested file system {name}')
+            return fs['mdsmap']
 
-    logger.error(f'ERROR could not find file system with name {name}')
+    print(f'ERROR could not find file system with name {name}')
     exit(1)
 
 
 def get_current_standby_assignment(fs):
-    return {mds['name']: mds['rank'] for _gid, mds in fs['info'].items() if
-            mds['state'] == 'up:standby_replay'}
+    return {mds['rank']: mds['name'] for _gid, mds in fs['info'].items() if
+            mds['state'] == 'up:standby-replay'}
 
 
 def get_cold_standby(fs):
@@ -42,31 +41,39 @@ def get_cold_standby(fs):
 
 
 def check(current, wanted, cold, last=[]):
-    if current == wanted:
-        return last
     restart_rank = ''
     if cold in wanted:
         # current cold is wanted as replay
         wanted_rank = wanted[cold]
         restart_rank = current[wanted_rank]
     else:
-        # standby_replays are assigned ti the wrong ranks
+        # all wanted standby_replays are standby_replays, but assigned to the wrong ranks
+        current_standbys = current.values()
         for mds, rank in wanted.items():
+            if mds not in current_standbys:
+                print((f'mds {mds} is not listed in current standbys, its '
+                       'either active or doesn\'t exist. Skipping...'))
+                continue
             if current[rank] == mds:
-                # this one if where we want it
-                logger.info(f'mds {mds} is assigned to the wanted rank {rank}')
+                # this one is where we want it
+                print(f'mds {mds} is assigned to the wanted rank {rank}')
                 continue
             if mds in last and mds == last[0]:
-                logger.info(f'mds {mds} was just restarted')
+                print(f'mds {mds} was just restarted, trying to find another one')
+                continue
 
-            logger.info(f'chose mds {mds} for restart')
+            print(f'chose mds {mds} for restart')
             restart_rank = mds
             break
+    if not restart_rank:
+        return last
 
-    # actually restart
+    print(f'{restart_rank} is not the wanted standby_replay, will restart')
+    subprocess.run(['ceph', 'mds', 'fail', restart_rank],
+                   stdout=subprocess.PIPE,
+                   stderr=subprocess.PIPE)
 
-    # restart mds
-    return last.append(restart_rank)
+    return last + [restart_rank]
 
 
 class MDSStandbyFor(object):
@@ -96,23 +103,27 @@ class MDSStandbyFor(object):
             fsmap = get_fs_map()
 
             if not fsmap['standbys']:
-                logger.error('ERROR no unassigned standbys found in fsmap')
+                print('ERROR no unassigned standbys found in fsmap')
                 exit(1)
 
             if len(fsmap['standbys']) != 1:
-                logger.error('ERROR no can only work with 1 unassigned standby, got {len(fsmap["standbys"])}')
+                print(f'ERROR no can only work with 1 unassigned standby, got {len(fsmap["standbys"])}')
                 exit(1)
 
             fs = get_fs(self.args.fs, fsmap)
 
             current = get_current_standby_assignment(fs)
-            cold = get_cold_standby(fs)
-            new_last = check(current, self.args.standby_assignments, cold)
+            cold = get_cold_standby(fsmap)
+            new_last = check(current, self.args.standby_assignment, cold)
             if last == new_last:
-                logger.info('done')
+                print('done')
+                exit(0)
+            elif not new_last:
+                print('nothing was restarted, assuming we\'re done')
                 exit(0)
             else:
                 last = new_last
+                sleep(5)
         exit(1)
 
 
